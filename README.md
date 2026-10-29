@@ -64,7 +64,7 @@
 ### 快速启动（后端）
 
 ```bash
-git clone https://github.com/your-org/pdfplat.git
+git clone https://github.com/jethely/pdfplat.git
 cd pdfplat
 
 # 创建虚拟环境并安装依赖
