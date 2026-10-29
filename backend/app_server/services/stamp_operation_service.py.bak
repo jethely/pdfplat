@@ -1,0 +1,456 @@
+"""普通印章擦除服务（非骑缝章）。
+
+复用 perforated_stamp_service 的红色检测，但不限制在页面右侧边缘，
+可检测页面任意位置的圆形/椭圆形红色印章，用白色覆盖擦除。
+支持通过 pages 参数过滤页码。
+"""
+import re
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pymupdf as fitz
+
+from app_server.core.utils import sanitize_filename
+from app_server.services.perforated_stamp_service import (
+    extract_red_mask,
+)
+
+DPI = 300
+W_HI = 400
+BBOX_PAD_PX = 30
+FEATHER_PX = 15
+
+
+def locate_stamps_on_page(img_bgr, mask):
+    """检测页面内任意位置的红色印章（不限制在右侧边缘）。
+
+    关键：印章的簇整体呈正方形/圆形（宽高比接近 1:1），
+    而红色文字呈细长条（宽 >> 高）。据此过滤掉文字区域。
+    """
+    h, w = mask.shape
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    if num_labels <= 1:
+        return []
+
+    valid = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        top = stats[i, cv2.CC_STAT_TOP]
+        left = stats[i, cv2.CC_STAT_LEFT]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+        right = left + width
+        cy = top + height / 2.0
+
+        if area < 80 or width > W_HI or height > W_HI:
+            continue
+
+        ratio = width / max(height, 1)
+        if ratio > 3.0 or ratio < 0.25:
+            continue
+
+        valid.append({
+            'idx': i, 'top': top, 'bottom': top + height,
+            'left': left, 'right': right, 'width': width,
+            'height': height, 'area': area, 'cy': cy,
+        })
+
+    if not valid:
+        return []
+
+    valid.sort(key=lambda c: c['cy'])
+    cy_groups = []
+    for comp in valid:
+        if not cy_groups:
+            cy_groups.append([comp])
+        else:
+            cluster_mean_cy = np.mean([c['cy'] for c in cy_groups[-1]])
+            if abs(comp['cy'] - cluster_mean_cy) < 180:
+                cy_groups[-1].append(comp)
+            else:
+                cy_groups.append([comp])
+
+    clusters = []
+    for cy_grp in cy_groups:
+        cy_grp.sort(key=lambda c: (c['left'] + c['right']) / 2)
+        x_groups = []
+        for comp in cy_grp:
+            cx = (comp['left'] + comp['right']) / 2
+            if not x_groups:
+                x_groups.append([comp])
+            else:
+                last_cx = np.mean([(c['left'] + c['right']) / 2 for c in x_groups[-1]])
+                if abs(cx - last_cx) < 120:
+                    x_groups[-1].append(comp)
+                else:
+                    x_groups.append([comp])
+        clusters.extend(x_groups)
+
+    results = []
+    for cluster in clusters:
+        tops = [c['top'] for c in cluster]
+        bottoms = [c['bottom'] for c in cluster]
+        lefts = [c['left'] for c in cluster]
+        rights = [c['right'] for c in cluster]
+        cys = [c['cy'] for c in cluster]
+
+        abs_top = min(tops)
+        abs_bottom = max(bottoms)
+        left_x = min(lefts)
+        right_x = max(rights)
+        bw = right_x - left_x
+        bh = abs_bottom - abs_top
+
+        cluster_ratio = bw / max(bh, 1)
+        min_span = min(bw, bh)
+
+        if min_span < 60:
+            continue
+        if cluster_ratio > 2.8 or cluster_ratio < 0.35:
+            continue
+
+        results.append({
+            'abs_top': abs_top,
+            'abs_bottom': abs_bottom,
+            'left_x': left_x,
+            'right_x': right_x,
+            'cy': float(np.median(cys)),
+        })
+
+    return results
+
+
+def px_rect_to_pt(px_x0, px_x1, px_y0, px_y1, dpi):
+    scale = 72.0 / dpi
+    return fitz.Rect(px_x0 * scale, px_y0 * scale, px_x1 * scale, px_y1 * scale)
+
+
+def parse_pages_spec(pages_str, total_pages):
+    """解析页码表达式，返回 0-indexed 的页码集合。
+
+    支持:
+      all / ""        → 全部页
+      last            → 最后一页
+      N               → 第 N 页 (1-indexed)
+      N-M             → 第 N 到 M 页 (包含, 1-indexed)
+      N,M,K           → 多个页码
+    """
+    if not pages_str or pages_str.strip().lower() in ('all', '*', ''):
+        return set(range(total_pages))
+
+    result = set()
+    parts = re.split(r'[,，\s]+', pages_str.strip())
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        low = part.lower()
+        if low == 'last':
+            result.add(total_pages - 1)
+            continue
+        if low == 'first':
+            result.add(0)
+            continue
+
+        m = re.match(r'^(\d+)\s*-\s*(\d+)$', part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            a, b = min(a, b), max(a, b)
+            for p in range(a, b + 1):
+                if 1 <= p <= total_pages:
+                    result.add(p - 1)
+            continue
+
+        if part.isdigit():
+            p = int(part)
+            if 1 <= p <= total_pages:
+                result.add(p - 1)
+
+    return result
+
+
+def _page_actual_dpi(doc, page_idx, fallback_dpi=DPI):
+    p = doc[page_idx]
+    imgs = p.get_images(full=True)
+    for xref_tuple in imgs:
+        xref = xref_tuple[0]
+        info = doc.extract_image(xref)
+        w = info['width']
+        rects = p.get_image_rects(xref)
+        for r in rects:
+            if r.width > 0:
+                return int(round(w / r.width * 72))
+    return fallback_dpi
+
+
+EXCESS_THRESHOLD = 3
+EDGE_STAMP_MARGIN = 60
+EDGE_BRIDGE_KERNEL = 21
+
+
+def _remove_edge_touching_stamps(weak_red, page_w, page_h):
+    """排除触碰页面边缘的骑缝章。
+
+    步骤：
+    1. 种子：任何连通域 bounding box 距离页面边缘 < EDGE_STAMP_MARGIN 的，标记为骑缝章种子
+    2. Close 桥接：把种子附近的碎片（包括不触边的圆形碎片）粘成完整 mask
+
+    返回: (non_edge_red, edge_mask)
+    """
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(weak_red)
+    if n <= 1:
+        return weak_red, np.zeros(weak_red.shape, dtype=np.uint8)
+
+    seed_mask = np.zeros(weak_red.shape, dtype=np.uint8)
+    for i in range(1, n):
+        left = stats[i, cv2.CC_STAT_LEFT]
+        right = left + stats[i, cv2.CC_STAT_WIDTH]
+        top = stats[i, cv2.CC_STAT_TOP]
+        bot = top + stats[i, cv2.CC_STAT_HEIGHT]
+
+        touches = (
+            left < EDGE_STAMP_MARGIN
+            or right > page_w - EDGE_STAMP_MARGIN
+            or top < EDGE_STAMP_MARGIN
+            or bot > page_h - EDGE_STAMP_MARGIN
+        )
+        if touches:
+            seed_mask[labels == i] = 255
+
+    if cv2.countNonZero(seed_mask) == 0:
+        return weak_red, np.zeros(weak_red.shape, dtype=np.uint8)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (EDGE_BRIDGE_KERNEL, EDGE_BRIDGE_KERNEL))
+    edge_mask = cv2.morphologyEx(seed_mask, cv2.MORPH_CLOSE, k)
+
+    non_edge_red = cv2.subtract(weak_red, edge_mask)
+    return non_edge_red, edge_mask
+
+
+def _detect_complete_stamps(excess, page_w, page_h):
+    """通过高阈值分离+凸包形状检测，找出页内完整圆形/方形印章。
+
+    原理:
+    1. exc>=20 高阈值提取印章核心红色
+    2. kernel=30 闭运算只填印章内部文字缝隙，不连接外侧骑缝章碎片
+    3. 连通域分析: 面积≥15000 + 不触页边缘 + 凸包形状近似圆/方形
+    4. 用凸包填充作为印章mask(无内部空洞) + 膨胀覆盖淡红边缘
+
+    返回: complete_seal_mask (uint8), 只包含完整印章区域
+    """
+    red_core = cv2.threshold(excess, 20, 255, cv2.THRESH_BINARY)[1]
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (30, 30))
+    red_closed = cv2.morphologyEx(red_core, cv2.MORPH_CLOSE, kernel)
+
+    num_cc, labels, stats, _ = cv2.connectedComponentsWithStats(red_closed, 8)
+    complete_mask = np.zeros((page_h, page_w), dtype=np.uint8)
+
+    for i in range(1, num_cc):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 15000:
+            continue
+
+        cc_mask = (labels == i).astype(np.uint8)
+
+        touch_left = bool((cc_mask[:, 0] > 0).any())
+        touch_right = bool((cc_mask[:, -1] > 0).any())
+        touch_top = bool((cc_mask[0, :] > 0).any())
+        touch_bottom = bool((cc_mask[-1, :] > 0).any())
+        if touch_left or touch_right or touch_top or touch_bottom:
+            continue
+
+        contours, _ = cv2.findContours(cc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) != 1:
+            continue
+        cnt = contours[0]
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        hull_perim = cv2.arcLength(hull, True)
+        if hull_perim == 0 or hull_area == 0:
+            continue
+        hull_circ = 4 * np.pi * hull_area / (hull_perim ** 2)
+        _, _, hull_bw, hull_bh = cv2.boundingRect(hull)
+        hull_aspect = hull_bw / hull_bh if hull_bh > 0 else 0
+        hull_rect_fill = hull_area / (hull_bw * hull_bh) if hull_bw * hull_bh > 0 else 0
+
+        is_round = hull_circ > 0.65 and 0.75 < hull_aspect < 1.35
+        is_square = hull_rect_fill > 0.8 and 0.65 < hull_aspect < 1.6
+
+        if is_round or is_square:
+            hull_mask = np.zeros((page_h, page_w), dtype=np.uint8)
+            cv2.fillPoly(hull_mask, [hull], 255)
+            complete_mask = cv2.bitwise_or(complete_mask, hull_mask)
+
+    if complete_mask.sum() > 0:
+        seal_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+        complete_mask = cv2.dilate(complete_mask, seal_k, iterations=1)
+
+    return complete_mask
+
+
+def _erase_in_region(img_bgr, stamp_area_mask, non_edge_red_mask, excess):
+    """印章擦除 v30 — 实际有红像素 + 微膨胀 mask 直接 inpaint.
+
+    v29 问题: 全设白导致白色硬边(浅色轮廓可见) + 膨胀洗白非红页面文字.
+
+    v30 方案: inpaint mask = (exc>=1) 微膨胀1px + 限制在印章区域内,
+    直接在原始图像上用周围纸白纹理填充.
+      - 不去红通道 (避免硬边)
+      - 不全设白 (避免白色块)
+      - 微膨胀 k=3 覆盖淡墨边缘, 洗白非红页面文字仅 1.2%
+    """
+    EXCESS_RED = 1
+    INPAINT_RADIUS = 5
+    MASK_DILATE_K = 3
+
+    in_area = stamp_area_mask > 0
+
+    base_mask = in_area & (excess >= EXCESS_RED)
+
+    if not base_mask.any():
+        return img_bgr
+
+    k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (MASK_DILATE_K, MASK_DILATE_K)
+    )
+    mask = cv2.dilate(base_mask.astype(np.uint8) * 255, k, iterations=1) > 0
+    mask = mask & in_area
+
+    mask_uint8 = mask.astype(np.uint8) * 255
+
+    result = cv2.inpaint(img_bgr, mask_uint8, INPAINT_RADIUS, cv2.INPAINT_TELEA)
+
+    return result
+
+
+def _build_feather_mask(stamp_area_shape, out_h, out_w, feather_px):
+    """根据印章膨胀区域构建 alpha mask。
+
+    羽化带必须完全限制在 stamp_area 内部，外部强制 alpha=0，
+    否则外部 alpha<255 会露出矢量底图上的红色印章。
+    """
+    if cv2.countNonZero(stamp_area_shape) == 0:
+        return np.zeros((out_h, out_w), dtype=np.uint8)
+
+    binary = (stamp_area_shape > 0).astype(np.uint8) * 255
+    binary_bool = binary > 0
+
+    if feather_px > 0:
+        kernel_e = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feather_px, feather_px))
+        inner_core = cv2.erode(binary, kernel_e, iterations=1)
+        ring = binary - inner_core
+        ksize = feather_px * 2 + 1
+        ring_blur = cv2.GaussianBlur(ring, (ksize, ksize), feather_px / 2.0)
+        ring_blur[~binary_bool] = 0
+        alpha = cv2.add(inner_core, ring_blur)
+    else:
+        alpha = binary
+
+    return alpha
+
+
+def erase_seals_on_doc(doc, page_indices, dpi=DPI):
+    total_erased = 0
+    out_doc = fitz.open()
+    page_indices_set = set(page_indices)
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pt_per_px = 72.0 / dpi
+
+    stamp_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+
+    for page_idx in range(doc.page_count):
+        src_page = doc[page_idx]
+        pw_pt, ph_pt = src_page.rect.width, src_page.rect.height
+        new_page = out_doc.new_page(width=pw_pt, height=ph_pt)
+
+        if page_idx not in page_indices_set:
+            new_page.show_pdf_page(new_page.rect, doc, page_idx)
+            continue
+
+        pix = src_page.get_pixmap(matrix=mat)
+        img_bgr = cv2.cvtColor(
+            np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n),
+            cv2.COLOR_RGB2BGR,
+        )
+
+        B, G, R = cv2.split(img_bgr)
+        excess = np.clip(
+            R.astype(np.int16) - np.maximum(G, B).astype(np.int16), 0, 255
+        ).astype(np.uint8)
+        excess_binary = cv2.threshold(excess, EXCESS_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
+
+        if cv2.countNonZero(excess_binary) == 0:
+            new_page.show_pdf_page(new_page.rect, doc, page_idx)
+            continue
+
+        page_h, page_w = img_bgr.shape[:2]
+
+        complete_seal_mask = _detect_complete_stamps(excess, page_w, page_h)
+
+        if complete_seal_mask.sum() == 0:
+            new_page.show_pdf_page(new_page.rect, doc, page_idx)
+            continue
+
+        weak_red = cv2.threshold(excess, 1, 255, cv2.THRESH_BINARY)[1]
+        target_red = cv2.bitwise_and(weak_red, complete_seal_mask)
+
+        stamp_area = complete_seal_mask
+        erased = _erase_in_region(img_bgr, stamp_area, target_red, excess)
+
+        _, buf = cv2.imencode('.png', erased, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        rect_pt = fitz.Rect(0, 0, page_w * pt_per_px, page_h * pt_per_px)
+        new_page.insert_image(rect_pt, stream=buf.tobytes())
+
+        RED_CC_MIN_AREA = 20000
+        num_cc, _, stats_cc, _ = cv2.connectedComponentsWithStats(target_red, 8)
+        stamp_count = sum(
+            1 for i in range(1, num_cc) if stats_cc[i, cv2.CC_STAT_AREA] >= RED_CC_MIN_AREA
+        )
+        total_erased += stamp_count
+        print(f"  页{page_idx + 1}: 擦除 {stamp_count} 个印章 (纯光栅 @ {dpi} DPI)")
+
+    return out_doc, total_erased
+
+
+def dispatch_stamp_erase(
+    pdf_bytes: bytes,
+    output_dir: Path,
+    safe_name: str,
+    pages: str = "all",
+    dpi: int = DPI,
+) -> dict:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = doc.page_count
+
+    page_set = parse_pages_spec(pages, total_pages)
+    if not page_set:
+        doc.close()
+        raise ValueError(f"无效的页码范围: {pages}")
+
+    sorted_pages = sorted(page_set)
+    print(f"\n印章擦除: 总共 {total_pages} 页, 目标 {len(sorted_pages)} 页: {[p+1 for p in sorted_pages]}")
+
+    out_doc, num_erased = erase_seals_on_doc(doc, sorted_pages, dpi=dpi)
+
+    base = sanitize_filename(Path(safe_name).stem, default="output")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_name = f"{base}_stamp_erased_{ts}.pdf"
+
+    try:
+        out_doc.save(str(output_dir / out_name), garbage=4, deflate=True)
+    finally:
+        out_doc.close()
+        doc.close()
+
+    return {
+        "out_name": out_name,
+        "pages_affected": len(sorted_pages),
+        "stamps_erased": num_erased,
+        "action": "erase",
+        "action_label": "印章擦除",
+    }

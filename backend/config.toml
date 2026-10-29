@@ -1,0 +1,52 @@
+# ============================================================
+# PDF Tools 配置文件
+# 说明：
+#   1. 支持环境变量覆盖：
+#      APP_SECRET  → auth.secret
+#      APP_HOST    → server.host
+#      APP_PORT    → server.port
+#   2. 修改后需重启服务
+# ============================================================
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[auth]
+# token 签名密钥（生产环境务必通过 APP_SECRET 环境变量覆盖）
+secret = "pdf_jethely_18932_plat"
+# token 有效期（秒），默认 7 天
+token_ttl_seconds = 604800
+# 用户名 / 密码策略
+username_min_len = 3
+username_max_len = 32
+password_min_len = 6
+password_max_len = 64
+
+[storage]
+# 数据根目录（相对于 backend/，即 backend/storage）
+root = "storage"
+fonts_dir = "fonts"
+
+[crack]
+# 单次破解最长运行时间（秒）
+max_duration_seconds = 1800
+# CPU 占用目标（%）
+cpu_target_pct = 30
+# 每个 worker 预留内存（MB）
+mem_per_worker_mb = 300
+# 最大并行线程数
+max_workers = 16
+
+[file]
+# 文件名主干的截断长度
+max_stem_len = 80
+
+[ghostscript]
+preset_light  = "/printer"
+preset_medium = "/ebook"
+preset_high   = "/screen"
+timeout_seconds = 600
+
+[logging]
+level = "INFO"
